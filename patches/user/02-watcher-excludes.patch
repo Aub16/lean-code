@@ -1,0 +1,66 @@
+lean-code 02 — watcher-excludes
+===============================
+QUOI
+  files.watcherExclude : ajoute par défaut node_modules, dist, build, target,
+  .venv, venv, __pycache__, .next, vendor, coverage, .cache
+  (src/vs/workbench/contrib/files/browser/files.contribution.ts).
+
+POURQUOI
+  Le watcher récursif (parcel/inotify) est la première source de watches
+  (jusqu'à ~65 000) et de RAM sur les remotes. Le format réel du défaut
+  upstream n'utilise PAS "**/x/**" (commentaire upstream : motif "**" = RegExp
+  complexe et lent) mais "x/**" et "*/x/**" : on suit cette convention, donc
+  racine + 1 niveau (node_modules aussi à 2 niveaux pour les monorepos).
+  Les sous-dossiers plus profonds restent surveillés : à compléter dans les
+  settings si besoin.
+
+COMPROMIS
+  Les extensions utilisant createFileSystemWatcher respectent aussi cette
+  exclusion ; un projet Go avec vendor/ ou un workflow qui édite dist/ n'aura
+  plus de rafraîchissement auto de l'explorateur. Surcharge utilisateur possible
+  via files.watcherExclude.
+
+COMMENT TESTER
+  1. Ouvrir un projet avec node_modules ; sur Linux :
+     cat /proc/<pid fileWatcher>/fdinfo/* | grep -c inotify  (avant/après).
+  2. Paramètres > files.watcherExclude contient les nouvelles entrées.
+  3. Modifier un fichier dans src/ : l'explorateur se met à jour ; dans
+     node_modules/ : non.
+  4. Rebase : git apply --check patches/user/02-watcher-excludes.patch dans vscode/.
+
+--- a/src/vs/workbench/contrib/files/browser/files.contribution.ts
++++ b/src/vs/workbench/contrib/files/browser/files.contribution.ts
+@@ -304,7 +304,32 @@
+ 				'.hg/store/**': true,
+ 				'*/.git/objects/**': true,
+ 				'*/.git/subtree-cache/**': true,
+-				'*/.hg/store/**': true
++				'*/.hg/store/**': true,
++				// lean-code: heavy generated/dependency folders (root and one level deep; node_modules also two levels deep,
++				// see the note above about avoiding a leading '**' pattern)
++				'node_modules/**': true,
++				'*/node_modules/**': true,
++				'*/*/node_modules/**': true,
++				'dist/**': true,
++				'*/dist/**': true,
++				'build/**': true,
++				'*/build/**': true,
++				'target/**': true,
++				'*/target/**': true,
++				'.venv/**': true,
++				'*/.venv/**': true,
++				'venv/**': true,
++				'*/venv/**': true,
++				'__pycache__/**': true,
++				'*/__pycache__/**': true,
++				'.next/**': true,
++				'*/.next/**': true,
++				'vendor/**': true,
++				'*/vendor/**': true,
++				'coverage/**': true,
++				'*/coverage/**': true,
++				'.cache/**': true,
++				'*/.cache/**': true,
+ 			},
+ 			'markdownDescription': nls.localize('watcherExclude', "Configure paths or [glob patterns](https://aka.ms/vscode-glob-patterns) to exclude from file watching. Paths can either be relative to the watched folder or absolute. Glob patterns are matched relative from the watched folder. When you experience the file watcher process consuming a lot of CPU, make sure to exclude large folders that are of less interest (such as build output folders)."),
+ 			'scope': ConfigurationScope.RESOURCE

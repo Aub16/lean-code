@@ -1,0 +1,54 @@
+lean-code 01 — chat-off-by-default
+==================================
+QUOI
+  - chat.agent.enabled : défaut true -> false
+    (src/vs/workbench/contrib/chat/browser/chat.shared.contribution.ts)
+  - Serveur distant (REH) : ne démarre plus l'Agent Host en lazy à la première
+    connexion d'un renderer ; le canal agentHostProxy est enregistré en mode
+    "indisponible" (src/vs/server/node/serverServices.ts).
+    Ré-activation : variable d'environnement LEAN_CODE_AGENT_HOST=1 côté serveur.
+
+POURQUOI
+  Les OOM distants viennent surtout du chat/agents depuis VS Code 1.120
+  (microsoft/vscode#324188). Au commit épinglé (1.140.0), VSCodium met DÉJÀ
+  chat.disableAIFeatures=true (patch 00-copilot-fix-action-condition) et supprime
+  les agents Copilot/Codex de l'Agent Host (53-ext-copilot-remove-it) : ce patch
+  ne couvre que ce qui reste (mode agent actif par défaut + process Agent Host
+  lancé paresseusement par le serveur, branche "DEFAULT" de serverServices.ts).
+
+COMMENT TESTER
+  1. ./dev/build.sh puis lancer le REH ; dans le log serveur chercher
+     "[AgentHostChannel] Registered unavailable IPC channel" (et PAS "lazy").
+  2. pgrep -af agentHost sur la remote : aucun process après connexion + ouverture
+     d'un dossier. Avec LEAN_CODE_AGENT_HOST=1 le process réapparaît.
+  3. Client : Paramètres > chat.agent.enabled = false par défaut.
+  4. Rebase : git apply --check patches/user/01-chat-off-by-default.patch dans vscode/.
+
+NON COUVERT (volontairement) : retrait de "defaultChatAgent" de product.json
+(non vérifié sans build, risque de null non géré) ; Agent Host local Electron.
+
+--- a/src/vs/workbench/contrib/chat/browser/chat.shared.contribution.ts
++++ b/src/vs/workbench/contrib/chat/browser/chat.shared.contribution.ts
+@@ -1540,7 +1540,7 @@
+ 		[ChatConfiguration.AgentEnabled]: {
+ 			type: 'boolean',
+ 			description: nls.localize('chat.agent.enabled.description', "When enabled, agent mode can be activated from chat and tools in agentic contexts with side effects can be used."),
+-			default: true,
++			default: false,
+ 			order: 1,
+ 			policy: {
+ 				name: 'ChatAgentMode',
+--- a/src/vs/server/node/serverServices.ts
++++ b/src/vs/server/node/serverServices.ts
+@@ -335,6 +335,11 @@
+ 			socketServer.registerChannel(AgentHostIpcChannels.RemoteProxy, new UnavailableAgentHostChannel<RemoteAgentConnectionContext>());
+ 			logService.info(`[AgentHostChannel] Registered unavailable IPC channel '${AgentHostIpcChannels.RemoteProxy}': no --agent-host-bridge-port / --agent-host-bridge-path set.`);
+ 		}
++	} else if (process.env['LEAN_CODE_AGENT_HOST'] !== '1') {
++		// lean-code: do not lazily spawn a local agent host child process by default.
++		// Set LEAN_CODE_AGENT_HOST=1 in the server environment to restore upstream behavior.
++		socketServer.registerChannel(AgentHostIpcChannels.RemoteProxy, new UnavailableAgentHostChannel<RemoteAgentConnectionContext>());
++		logService.info(`[AgentHostChannel] Registered unavailable IPC channel '${AgentHostIpcChannels.RemoteProxy}': agent host disabled (set LEAN_CODE_AGENT_HOST=1 to enable).`);
+ 	} else {
+ 		try {
+ 			const socketPath = createRandomIPCHandle();
