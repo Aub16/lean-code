@@ -1,0 +1,579 @@
+lean-code 09 — ssh-folder-search
+================================
+QUOI
+  Recherche de dossiers optimisée pour le sélecteur de dossiers distant (SSH) :
+  - À la connexion à un hôte SSH (autorité "ssh-remote+..."), une notification demande une
+    fois par hôte : "Optimiser la recherche de dossiers ?" (Optimiser / Non merci).
+    Réglage : lean.remote.optimizeFolderSearch = ask (défaut) | always | never.
+  - Si activé : quand l'utilisateur tape un nom (>= 2 caractères) sous le dossier courant,
+    les enfants du dossier courant restent affichés en premier ; les dossiers plus profonds
+    sont cherchés au fil de l'eau (parcours en largeur, par vagues) et ajoutés en bas.
+    Classement : qualité du nom, habitudes (historique des dossiers réellement ouverts sur
+    cet hôte, avec décroissance de 14 jours, ancêtres/descendants pondérés), présence de
+    marqueurs de projet (.git, package.json, ...) et profondeur.
+  - À l'ouverture du sélecteur : jusqu'à 5 dossiers fréquents de l'hôte sont proposés après
+    les enfants du dossier courant.
+  - Garde-fous : profondeur 4, 400 dossiers max, 30 résultats, 8 s, annulation à chaque frappe ;
+    node_modules, .git, dist, build, target, venv, .cache, etc. ne sont pas parcourus.
+
+FICHIERS
+  + src/vs/workbench/services/dialogs/browser/leanFolderSearch.ts  (moteur, historique, réglage)
+  + src/vs/workbench/contrib/remote/browser/leanFolderSearchPrompt.contribution.ts  (prompt)
+  ~ src/vs/workbench/services/dialogs/browser/simpleFileDialog.ts  (hooks ; +IConfigurationService)
+  ~ src/vs/workbench/workbench.common.main.ts  (import de la contribution)
+
+POURQUOI
+  Sur un serveur distant volumineux, naviguer dossier par dossier et le listage complet sont
+  lents ; on privilégie ce qui est proche et ce que l'utilisateur ouvre d'habitude.
+
+LIMITES
+  "Branche où le client se trouve" = le dossier courant du sélecteur (pas la branche git).
+  L'historique est local au client (stockage APPLICATION), par hôte. Pas de tests unitaires ;
+  simpleFileDialog.test.ts instancie SimpleFileDialog : vérifier qu'IConfigurationService y
+  est fourni (nouvelle dépendance).
+
+COMMENT TESTER
+  1. Build (lean-build-wsl.sh patched), lancer le client, se connecter à un hôte SSH
+     (extension Open Remote - SSH) : la notification doit apparaître une fois.
+  2. File > Open Folder... : taper 2+ lettres d'un dossier profond : il apparaît en bas de liste
+     avec la description "search result", les enfants directs restant en haut.
+  3. Ouvrir un dossier, rouvrir le sélecteur : il est proposé avec la description "frequent".
+  4. lean.remote.optimizeFolderSearch = never : comportement upstream inchangé.
+  5. Rebase : git apply --check patches/user/09-ssh-folder-search.patch dans vscode/.
+
+--- /dev/null
++++ b/src/vs/workbench/services/dialogs/browser/leanFolderSearch.ts
+@@ -0,0 +1,268 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++// lean-code: progressive, habit-aware folder search for the remote (SSH) folder picker.
++
++import * as nls from '../../../../nls.js';
++import { CancellationToken } from '../../../../base/common/cancellation.js';
++import { URI } from '../../../../base/common/uri.js';
++import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
++import { Extensions as ConfigurationExtensions, IConfigurationRegistry } from '../../../../platform/configuration/common/configurationRegistry.js';
++import { IFileService } from '../../../../platform/files/common/files.js';
++import { Registry } from '../../../../platform/registry/common/platform.js';
++import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
++
++export const LEAN_FOLDER_SEARCH_SETTING = 'lean.remote.optimizeFolderSearch';
++export type LeanFolderSearchSetting = 'ask' | 'always' | 'never';
++
++Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).registerConfiguration({
++	id: 'leanRemote',
++	title: nls.localize('leanRemote.title', "Lean Remote"),
++	type: 'object',
++	properties: {
++		[LEAN_FOLDER_SEARCH_SETTING]: {
++			type: 'string',
++			enum: ['ask', 'always', 'never'],
++			enumDescriptions: [
++				nls.localize('leanRemote.optimize.ask', "Ask once per SSH host when connecting."),
++				nls.localize('leanRemote.optimize.always', "Always optimize the remote folder search."),
++				nls.localize('leanRemote.optimize.never', "Never optimize the remote folder search.")
++			],
++			default: 'ask',
++			description: nls.localize('leanRemote.optimize', "Optimize the remote folder picker: results are searched progressively below the current folder, ranked by proximity and by the folders you open most often on this host.")
++		}
++	}
++});
++
++const modeKey = (authority: string) => `lean.remote.folderSearch.mode.${authority}`;
++const historyKey = (authority: string) => `lean.remote.folderSearch.history.${authority}`;
++
++export function getLeanFolderSearchChoice(storageService: IStorageService, authority: string): 'on' | 'off' | undefined {
++	const value = storageService.get(modeKey(authority), StorageScope.APPLICATION);
++	return value === 'on' || value === 'off' ? value : undefined;
++}
++
++export function setLeanFolderSearchChoice(storageService: IStorageService, authority: string, enabled: boolean): void {
++	storageService.store(modeKey(authority), enabled ? 'on' : 'off', StorageScope.APPLICATION, StorageTarget.MACHINE);
++}
++
++export function isLeanFolderSearchEnabled(configurationService: IConfigurationService, storageService: IStorageService, authority: string | undefined): boolean {
++	if (!authority) {
++		return false;
++	}
++	const setting = configurationService.getValue<LeanFolderSearchSetting>(LEAN_FOLDER_SEARCH_SETTING);
++	if (setting === 'always') {
++		return true;
++	}
++	if (setting === 'never') {
++		return false;
++	}
++	return getLeanFolderSearchChoice(storageService, authority) === 'on';
++}
++
++interface IHistoryEntry {
++	/** visit count */
++	c: number;
++	/** last visit (epoch ms) */
++	t: number;
++}
++
++function trimSlash(path: string): string {
++	return path.length > 1 && path.endsWith('/') ? path.substring(0, path.length - 1) : path;
++}
++
++/**
++ * Per-host history of folders the user actually opened. Used to rank search results and suggestions.
++ */
++export class LeanFolderHistory {
++
++	private static readonly MAX_ENTRIES = 200;
++	private static readonly HALF_LIFE_DAYS = 14;
++
++	constructor(
++		private readonly storageService: IStorageService,
++		private readonly authority: string
++	) { }
++
++	private load(): Record<string, IHistoryEntry> {
++		try {
++			const raw = this.storageService.get(historyKey(this.authority), StorageScope.APPLICATION);
++			const parsed = raw ? JSON.parse(raw) : {};
++			return parsed && typeof parsed === 'object' ? parsed : {};
++		} catch {
++			return {};
++		}
++	}
++
++	private static weight(entry: IHistoryEntry, now: number): number {
++		const ageDays = Math.max(0, (now - entry.t) / 86_400_000);
++		return entry.c * Math.pow(0.5, ageDays / LeanFolderHistory.HALF_LIFE_DAYS);
++	}
++
++	record(folder: URI): void {
++		const path = trimSlash(folder.path);
++		const now = Date.now();
++		const entries = this.load();
++		const previous = entries[path];
++		entries[path] = { c: (previous?.c ?? 0) + 1, t: now };
++
++		const keys = Object.keys(entries);
++		if (keys.length > LeanFolderHistory.MAX_ENTRIES) {
++			keys.sort((a, b) => LeanFolderHistory.weight(entries[b], now) - LeanFolderHistory.weight(entries[a], now));
++			for (const key of keys.slice(LeanFolderHistory.MAX_ENTRIES)) {
++				delete entries[key];
++			}
++		}
++		this.storageService.store(historyKey(this.authority), JSON.stringify(entries), StorageScope.APPLICATION, StorageTarget.MACHINE);
++	}
++
++	/** Most useful visited folder paths first. */
++	top(count: number): string[] {
++		const now = Date.now();
++		const entries = this.load();
++		return Object.keys(entries)
++			.sort((a, b) => LeanFolderHistory.weight(entries[b], now) - LeanFolderHistory.weight(entries[a], now))
++			.slice(0, count);
++	}
++
++	/**
++	 * Habit score of a candidate folder: full weight when it was opened itself,
++	 * half when it contains a folder that was opened, a quarter when it lies below one.
++	 */
++	score(candidatePath: string): number {
++		const candidate = trimSlash(candidatePath);
++		const now = Date.now();
++		const entries = this.load();
++		let best = 0;
++		for (const path of Object.keys(entries)) {
++			const weight = LeanFolderHistory.weight(entries[path], now);
++			if (path === candidate) {
++				best = Math.max(best, weight);
++			} else if (path.startsWith(candidate + '/')) {
++				best = Math.max(best, weight * 0.5);
++			} else if (candidate.startsWith(path + '/')) {
++				best = Math.max(best, weight * 0.25);
++			}
++		}
++		return best;
++	}
++}
++
++export interface ILeanFolderHit {
++	readonly uri: URI;
++	/** Path relative to the folder the search started from. */
++	readonly relative: string;
++	readonly score: number;
++}
++
++export interface ILeanFolderSearchLimits {
++	readonly maxDepth: number;
++	readonly maxDirs: number;
++	readonly maxResults: number;
++	readonly maxMs: number;
++	readonly concurrency: number;
++}
++
++const DEFAULT_LIMITS: ILeanFolderSearchLimits = { maxDepth: 4, maxDirs: 400, maxResults: 30, maxMs: 8000, concurrency: 6 };
++
++const SKIPPED_DIRECTORIES = new Set([
++	'node_modules', '.git', 'dist', 'build', 'target', '.venv', 'venv', '__pycache__', '.next', 'vendor', 'coverage', '.cache', '.gradle', '.idea', '.vscode', '.lean-code-server', '.vscode-server', '.npm', '.cargo', '.rustup'
++]);
++
++const PROJECT_MARKERS = new Set(['.git', 'package.json', 'pom.xml', 'Cargo.toml', 'go.mod', 'pyproject.toml', 'composer.json', 'build.gradle', 'Makefile', 'docker-compose.yml', 'docker-compose.yaml']);
++
++function matchQuality(name: string, query: string): number {
++	const lowerName = name.toLowerCase();
++	if (lowerName === query) {
++		return 4;
++	}
++	if (lowerName.startsWith(query)) {
++		return 3;
++	}
++	if (new RegExp(`[-_. ]${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(lowerName)) {
++		return 2;
++	}
++	return lowerName.includes(query) ? 1 : 0;
++}
++
++/**
++ * Breadth-first search below `root`: closest folders first, in waves, so the picker can show results as they arrive.
++ * `onResults` receives the full, ranked result list after each wave that found something new.
++ */
++export async function leanSearchFolders(
++	fileService: IFileService,
++	root: URI,
++	rawQuery: string,
++	history: LeanFolderHistory,
++	token: CancellationToken,
++	onResults: (hits: ILeanFolderHit[]) => void,
++	limits: ILeanFolderSearchLimits = DEFAULT_LIMITS
++): Promise<void> {
++	const query = rawQuery.trim().toLowerCase();
++	if (!query) {
++		return;
++	}
++	const showHidden = query.startsWith('.');
++	const rootPath = trimSlash(root.path);
++	const started = Date.now();
++	const hits: ILeanFolderHit[] = [];
++	const queue: { uri: URI; depth: number }[] = [{ uri: root, depth: 0 }];
++	let visited = 0;
++
++	while (queue.length && visited < limits.maxDirs && !token.isCancellationRequested && Date.now() - started < limits.maxMs) {
++		const wave = queue.splice(0, limits.concurrency);
++		visited += wave.length;
++		let foundNew = false;
++
++		const resolved = await Promise.all(wave.map(async entry => {
++			try {
++				return { entry, stat: await fileService.resolve(entry.uri) };
++			} catch {
++				return { entry, stat: undefined };
++			}
++		}));
++		if (token.isCancellationRequested) {
++			return;
++		}
++
++		for (const { entry, stat } of resolved) {
++			const children = stat?.children ?? [];
++			const isProject = children.some(child => PROJECT_MARKERS.has(child.name));
++
++			// The folder we just listed is a candidate itself (the root is not).
++			if (entry.depth > 0) {
++				const name = entry.uri.path.split('/').filter(Boolean).pop() ?? '';
++				const quality = matchQuality(name, query);
++				if (quality > 0) {
++					const path = trimSlash(entry.uri.path);
++					const relative = path.startsWith(rootPath) ? path.substring(rootPath.length).replace(/^\//, '') : path;
++					const score = quality * 10 + history.score(path) * 5 + (isProject ? 3 : 0) - entry.depth * 2;
++					hits.push({ uri: entry.uri, relative, score });
++					foundNew = true;
++				}
++			}
++
++			if (entry.depth < limits.maxDepth) {
++				for (const child of children) {
++					if (!child.isDirectory || SKIPPED_DIRECTORIES.has(child.name) || (!showHidden && child.name.startsWith('.'))) {
++						continue;
++					}
++					queue.push({ uri: child.resource, depth: entry.depth + 1 });
++				}
++			}
++		}
++
++		if (foundNew) {
++			hits.sort((a, b) => b.score - a.score);
++			if (hits.length > limits.maxResults) {
++				hits.length = limits.maxResults;
++			}
++			onResults([...hits]);
++		}
++		if (hits.length >= limits.maxResults && hits[hits.length - 1].score > 20) {
++			return;
++		}
++	}
++}
+--- /dev/null
++++ b/src/vs/workbench/contrib/remote/browser/leanFolderSearchPrompt.contribution.ts
+@@ -0,0 +1,52 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++// lean-code: when connecting to a host over SSH, ask once whether to optimize the remote folder search.
++
++import * as nls from '../../../../nls.js';
++import { Disposable } from '../../../../base/common/lifecycle.js';
++import Severity from '../../../../base/common/severity.js';
++import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
++import { INotificationService } from '../../../../platform/notification/common/notification.js';
++import { IStorageService } from '../../../../platform/storage/common/storage.js';
++import { IWorkbenchContribution, registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
++import { IWorkbenchEnvironmentService } from '../../../services/environment/common/environmentService.js';
++import { getLeanFolderSearchChoice, LEAN_FOLDER_SEARCH_SETTING, LeanFolderSearchSetting, setLeanFolderSearchChoice } from '../../../services/dialogs/browser/leanFolderSearch.js';
++
++class LeanFolderSearchPrompt extends Disposable implements IWorkbenchContribution {
++
++	static readonly ID = 'workbench.contrib.leanFolderSearchPrompt';
++
++	constructor(
++		@IWorkbenchEnvironmentService environmentService: IWorkbenchEnvironmentService,
++		@IConfigurationService configurationService: IConfigurationService,
++		@IStorageService storageService: IStorageService,
++		@INotificationService notificationService: INotificationService
++	) {
++		super();
++
++		const authority = environmentService.remoteAuthority;
++		if (!authority || !authority.startsWith('ssh-remote+')) {
++			return;
++		}
++		if (configurationService.getValue<LeanFolderSearchSetting>(LEAN_FOLDER_SEARCH_SETTING) !== 'ask') {
++			return;
++		}
++		if (getLeanFolderSearchChoice(storageService, authority) !== undefined) {
++			return;
++		}
++
++		notificationService.prompt(
++			Severity.Info,
++			nls.localize('lean.folderSearch.prompt', "Optimize folder search on this SSH host? Folders below the current one are searched progressively and ranked by the folders you open most often."),
++			[
++				{ label: nls.localize('lean.folderSearch.enable', "Optimize"), run: () => setLeanFolderSearchChoice(storageService, authority, true) },
++				{ label: nls.localize('lean.folderSearch.disable', "No thanks"), run: () => setLeanFolderSearchChoice(storageService, authority, false) }
++			]
++		);
++	}
++}
++
++registerWorkbenchContribution2(LeanFolderSearchPrompt.ID, LeanFolderSearchPrompt, WorkbenchPhase.AfterRestored);
+--- a/src/vs/workbench/services/dialogs/browser/simpleFileDialog.ts
++++ b/src/vs/workbench/services/dialogs/browser/simpleFileDialog.ts
+@@ -26,9 +26,9 @@
+ import { IRemoteAgentEnvironment } from '../../../../platform/remote/common/remoteAgentEnvironment.js';
+ import { isValidBasename } from '../../../../base/common/extpath.js';
+ import { Emitter } from '../../../../base/common/event.js';
+-import { Disposable, DisposableStore, IDisposable, MutableDisposable } from '../../../../base/common/lifecycle.js';
++import { Disposable, DisposableStore, IDisposable, MutableDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
+ import { createCancelablePromise, CancelablePromise } from '../../../../base/common/async.js';
+-import { CancellationToken } from '../../../../base/common/cancellation.js';
++import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
+ import { ICommandHandler } from '../../../../platform/commands/common/commands.js';
+ import { IEditorService } from '../../editor/common/editorService.js';
+ import { normalizeDriveLetter } from '../../../../base/common/labels.js';
+@@ -39,6 +39,8 @@
+ import { Codicon } from '../../../../base/common/codicons.js';
+ import { ThemeIcon } from '../../../../base/common/themables.js';
+ import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
++import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
++import { ILeanFolderHit, isLeanFolderSearchEnabled, LeanFolderHistory, leanSearchFolders } from './leanFolderSearch.js';
+ 
+ export namespace OpenLocalFileCommand {
+ 	export const ID = 'workbench.action.files.openLocalFile';
+@@ -143,6 +145,15 @@
+ 
+ 	private _showDotFiles: boolean = true;
+ 
++	// lean-code: progressive, habit-aware folder search (see leanFolderSearch.ts)
++	private leanEnabled = false;
++	private leanHistory: LeanFolderHistory | undefined;
++	private leanSuggestionsPending = false;
++	private leanExtended = false;
++	private leanBaseItems: FileQuickPickItem[] = [];
++	private leanSearchCts: CancellationTokenSource | undefined;
++	private leanSearchTimer: ReturnType<typeof setTimeout> | undefined;
++
+ 	constructor(
+ 		@IFileService private readonly fileService: IFileService,
+ 		@IQuickInputService private readonly quickInputService: IQuickInputService,
+@@ -158,9 +169,11 @@
+ 		@IKeybindingService private readonly keybindingService: IKeybindingService,
+ 		@IContextKeyService contextKeyService: IContextKeyService,
+ 		@IAccessibilityService private readonly accessibilityService: IAccessibilityService,
+-		@IStorageService private readonly storageService: IStorageService
++		@IStorageService private readonly storageService: IStorageService,
++		@IConfigurationService private readonly configurationService: IConfigurationService
+ 	) {
+ 		super();
++		this._register(toDisposable(() => this.leanCancelSearch()));
+ 		this.remoteAuthority = this.environmentService.remoteAuthority;
+ 		this.contextKey = RemoteFileDialogContext.bindTo(contextKeyService);
+ 		this.scheme = this.pathService.defaultUriScheme;
+@@ -335,6 +348,9 @@
+ 	private async pickResource(isSave: boolean = false): Promise<URI[] | URI | undefined> {
+ 		this.allowFolderSelection = !!this.options.canSelectFolders;
+ 		this.allowFileSelection = !!this.options.canSelectFiles;
++		this.leanEnabled = !!this.remoteAuthority && !this.scopedAuthority && this.allowFolderSelection && isLeanFolderSearchEnabled(this.configurationService, this.storageService, this.remoteAuthority);
++		this.leanHistory = this.leanEnabled ? new LeanFolderHistory(this.storageService, this.remoteAuthority!) : undefined;
++		this.leanSuggestionsPending = this.leanEnabled;
+ 		this.separator = this.scopedAuthority ? '/' : this.labelService.getSeparator(this.scheme, this.remoteAuthority);
+ 		this.hidden = false;
+ 		this.isWindows = this.scopedAuthority ? false : await this.checkIsWindowsOS();
+@@ -524,6 +540,7 @@
+ 					this.filePickBox.activeItems = [];
+ 					this.userEnteredPathSegment = '';
+ 				}
++				this.leanScheduleSearch(value);
+ 			}
+ 		} catch {
+ 			// Since any text can be entered in the input box, there is potential for error causing input. If this happens, do nothing.
+@@ -635,6 +652,9 @@
+ 		}
+ 		if (await this.validate(resolveValue)) {
+ 			this.busy = false;
++			if (resolveValue && this.leanEnabled) {
++				this.leanHistory?.record(resolveValue);
++			}
+ 			return resolveValue;
+ 		}
+ 		this.busy = false;
+@@ -1044,6 +1064,9 @@
+ 				this.userEnteredPathSegment = userEnteredPathSegment;
+ 				this.filePickBox.itemActivation = ItemActivation.NONE;
+ 				this.filePickBox.items = items;
++				this.leanBaseItems = items;
++				this.leanExtended = false;
++				void this.leanShowSuggestions(currentFolder, token);
+ 
+ 				// the user might have continued typing while we were updating. Only update the input box if it doesn't match the directory.
+ 				if (!equalsIgnoreCase(this.filePickBox.value, newValue) && (force || wasDotDot)) {
+@@ -1119,6 +1142,109 @@
+ 		return child.substring(parent.length);
+ 	}
+ 
++	private leanCancelSearch(): void {
++		if (this.leanSearchTimer !== undefined) {
++			clearTimeout(this.leanSearchTimer);
++			this.leanSearchTimer = undefined;
++		}
++		this.leanSearchCts?.cancel();
++		this.leanSearchCts?.dispose();
++		this.leanSearchCts = undefined;
++	}
++
++	private leanSetItems(items: FileQuickPickItem[]): void {
++		const active = this.filePickBox.activeItems;
++		this.filePickBox.itemActivation = ItemActivation.NONE;
++		this.filePickBox.items = items;
++		if (active.length) {
++			this.filePickBox.activeItems = items.filter(item => active.some(a => a.uri.toString() === item.uri.toString() && a.label === item.label));
++		}
++	}
++
++	private leanCreateItem(uri: URI, label: string, description: string): FileQuickPickItem {
++		const folderUri = resources.addTrailingPathSeparator(uri, this.separator);
++		return { label, description, uri: folderUri, isFolder: true, iconClasses: getIconClasses(this.modelService, this.languageService, folderUri, FileKind.FOLDER) };
++	}
++
++	/**
++	 * First listing of the dialog: after the children of the current folder (always shown first),
++	 * suggest the folders opened most often on this host.
++	 */
++	private async leanShowSuggestions(folder: URI, token: CancellationToken): Promise<void> {
++		if (!this.leanEnabled || !this.leanHistory || !this.leanSuggestionsPending) {
++			return;
++		}
++		this.leanSuggestionsPending = false;
++		const known = new Set(this.leanBaseItems.map(item => item.uri.toString()));
++		const extra: FileQuickPickItem[] = [];
++		for (const path of this.leanHistory.top(5)) {
++			const uri = folder.with({ path });
++			const item = this.leanCreateItem(uri, this.pathFromUri(uri), nls.localize('lean.folderSearch.frequent', "frequent"));
++			if (known.has(item.uri.toString()) || resources.extUriIgnorePathCase.isEqual(uri, folder)) {
++				continue;
++			}
++			try {
++				if (await this.fileService.exists(uri)) {
++					extra.push(item);
++				}
++			} catch {
++				// ignore unreachable history entries
++			}
++		}
++		if (token.isCancellationRequested || this.hidden || !extra.length || !resources.extUriIgnorePathCase.isEqual(this.currentFolder, folder)) {
++			return;
++		}
++		this.leanBaseItems = [...this.leanBaseItems, ...extra];
++		this.leanSetItems(this.leanBaseItems);
++	}
++
++	/**
++	 * While the user types a name below the current folder, search deeper folders progressively.
++	 * Children of the current folder stay on top; deeper hits are appended as they are found.
++	 */
++	private leanScheduleSearch(value: string): void {
++		if (!this.leanEnabled || !this.leanHistory) {
++			return;
++		}
++		this.leanCancelSearch();
++		const prefix = this.pathFromUri(this.currentFolder, true);
++		const query = startsWithIgnoreCase(value, prefix) ? value.substring(prefix.length) : '';
++		if (query.length < 2 || /[\\/]/.test(query)) {
++			if (this.leanExtended) {
++				this.leanExtended = false;
++				this.leanSetItems(this.leanBaseItems);
++			}
++			return;
++		}
++
++		const history = this.leanHistory;
++		const folder = this.currentFolder;
++		const cts = new CancellationTokenSource();
++		this.leanSearchCts = cts;
++		this.leanSearchTimer = setTimeout(() => {
++			this.leanSearchTimer = undefined;
++			void leanSearchFolders(this.fileService, folder, query, history, cts.token, hits => this.leanApplyHits(hits, cts.token));
++		}, 200);
++	}
++
++	private leanApplyHits(hits: ILeanFolderHit[], token: CancellationToken): void {
++		if (token.isCancellationRequested || this.hidden) {
++			return;
++		}
++		const known = new Set(this.leanBaseItems.map(item => item.uri.toString()));
++		const extra: FileQuickPickItem[] = [];
++		for (const hit of hits) {
++			const item = this.leanCreateItem(hit.uri, hit.relative, nls.localize('lean.folderSearch.hit', "search result"));
++			if (!known.has(item.uri.toString())) {
++				extra.push(item);
++			}
++		}
++		if (extra.length || this.leanExtended) {
++			this.leanExtended = extra.length > 0;
++			this.leanSetItems([...this.leanBaseItems, ...extra]);
++		}
++	}
++
+ 	private async createBackItem(currFolder: URI): Promise<FileQuickPickItem | undefined> {
+ 		// For authority-scoped URIs, compare within the original scheme so
+ 		// that the authority is preserved and the root is detected correctly.
+--- a/src/vs/workbench/workbench.common.main.ts
++++ b/src/vs/workbench/workbench.common.main.ts
+@@ -353,6 +353,7 @@
+ // Remote
+ import './contrib/remote/common/remote.contribution.js';
+ import './contrib/remote/browser/remote.contribution.js';
++import './contrib/remote/browser/leanFolderSearchPrompt.contribution.js';
+ 
+ // Emmet
+ import './contrib/emmet/browser/emmet.contribution.js';

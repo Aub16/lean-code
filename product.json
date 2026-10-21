@@ -659,6 +659,8 @@
   "nameLong": "lean-code",
   "applicationName": "lean-code",
   "serverApplicationName": "lean-code-server",
+  "dataFolderName": ".lean-code",
+  "serverDataFolderName": ".lean-code-server",
   "extensionsGallery": {
     "serviceUrl": "https://open-vsx.org/vscode/gallery",
     "itemUrl": "https://open-vsx.org/vscode/item",
